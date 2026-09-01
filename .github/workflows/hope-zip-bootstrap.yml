@@ -20,6 +20,10 @@ jobs:
   bootstrap:
     runs-on: ubuntu-latest
 
+    env:
+      REPOSITORY: ${{ github.repository }}
+      INPUT_ARCHIVE: ${{ inputs.archive }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -32,35 +36,45 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ -n "${{ inputs.archive }}" ]]; then
-            ARCHIVE="${{ inputs.archive }}"
+          ARCHIVE="${INPUT_ARCHIVE:-}"
 
+          if [[ -n "$ARCHIVE" ]]; then
             if [[ ! -f "$ARCHIVE" ]]; then
-              echo "ERROR: Specified ZIP not found: $ARCHIVE"
+              echo "ERROR: Specified ZIP not found:"
+              echo "$ARCHIVE"
               exit 1
             fi
           else
-            mapfile -t ZIPS < <(find . -maxdepth 3 -type f -iname "*.zip" \
-              ! -path "./.git/*" | sort)
+            mapfile -t ZIPS < <(
+              find . -type f -iname "*.zip" \
+                ! -path "./.git/*" \
+                | sort
+            )
 
             if [[ "${#ZIPS[@]}" -eq 0 ]]; then
-              echo "ERROR: No ZIP archive found in repository."
+              echo "ERROR: No ZIP archive found."
               exit 1
             fi
 
             if [[ "${#ZIPS[@]}" -gt 1 ]]; then
-              echo "Found multiple ZIP files:"
+              echo "Multiple ZIP files were found:"
               printf '%s\n' "${ZIPS[@]}"
               echo
-              echo "Please run this workflow again and provide the ZIP filename."
+              echo "Run the workflow again and specify the ZIP filename."
               exit 1
             fi
 
             ARCHIVE="${ZIPS[0]#./}"
           fi
 
-          echo "Using archive: $ARCHIVE"
-          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+          echo "Selected archive:"
+          echo "$ARCHIVE"
+
+          {
+            echo "archive<<EOF"
+            echo "$ARCHIVE"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Prepare extraction directory
         shell: bash
@@ -69,20 +83,30 @@ jobs:
 
           rm -rf .hope-bootstrap
           mkdir -p .hope-bootstrap/source
+          mkdir -p .hope-bootstrap/output
 
       - name: Extract ZIP
+        env:
+          ARCHIVE: ${{ steps.detect.outputs.archive }}
         shell: bash
         run: |
           set -euo pipefail
 
-          ARCHIVE="${{ steps.detect.outputs.archive }}"
+          echo "Extracting:"
+          echo "$ARCHIVE"
 
           unzip -q "$ARCHIVE" -d .hope-bootstrap/source
 
-          echo "Extracted files:"
-          find .hope-bootstrap/source -maxdepth 3 -type f | sort | head -200
+          echo
+          echo "Extraction completed."
 
-      - name: Find project root
+          find .hope-bootstrap/source \
+            -maxdepth 4 \
+            -type f \
+            | sort \
+            | head -200
+
+      - name: Find Flutter project
         id: project
         shell: bash
         run: |
@@ -94,14 +118,206 @@ jobs:
             PROJECT_ROOT="$ROOT"
           else
             mapfile -t PUBSPECS < <(
-              find "$ROOT" -type f -name "pubspec.yaml" \
-                -not -path "*/.dart_tool/*" \
+              find "$ROOT" \
+                -type f \
+                -name "pubspec.yaml" \
+                ! -path "*/.dart_tool/*" \
                 | sort
             )
 
             if [[ "${#PUBSPECS[@]}" -eq 0 ]]; then
-              echo "ERROR: Could not find pubspec.yaml in extracted ZIP."
+              echo "ERROR: pubspec.yaml was not found."
+              echo
+              echo "Detected files:"
+              find "$ROOT" -maxdepth 3 -type f | sort | head -200
               exit 1
             fi
 
-            if [[ "${
+            PROJECT_ROOT="$(dirname "${PUBSPECS[0]}")"
+          fi
+
+          echo "Flutter project root:"
+          echo "$PROJECT_ROOT"
+
+          {
+            echo "project_root<<EOF"
+            echo "$PROJECT_ROOT"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter version
+        run: |
+          flutter --version
+
+      - name: Flutter pub get
+        env:
+          PROJECT_ROOT: ${{ steps.project.outputs.project_root }}
+        working-directory: ${{ steps.project.outputs.project_root }}
+        run: |
+          set -euo pipefail
+          flutter pub get
+
+      - name: Flutter analyze
+        env:
+          PROJECT_ROOT: ${{ steps.project.outputs.project_root }}
+        working-directory: ${{ steps.project.outputs.project_root }}
+        run: |
+          set -euo pipefail
+          flutter analyze
+
+      - name: Build release APK
+        env:
+          PROJECT_ROOT: ${{ steps.project.outputs.project_root }}
+        working-directory: ${{ steps.project.outputs.project_root }}
+        run: |
+          set -euo pipefail
+
+          flutter build apk --release
+
+      - name: Locate APK
+        id: apk
+        env:
+          PROJECT_ROOT: ${{ steps.project.outputs.project_root }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t APKS < <(
+            find "$PROJECT_ROOT/build/app/outputs" \
+              -type f \
+              -name "*.apk" \
+              | sort
+          )
+
+          if [[ "${#APKS[@]}" -eq 0 ]]; then
+            echo "ERROR: No APK was generated."
+            exit 1
+          fi
+
+          APK="${APKS[0]}"
+
+          echo "APK found:"
+          echo "$APK"
+
+          {
+            echo "apk<<EOF"
+            echo "$APK"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Prepare final APK
+        env:
+          APK: ${{ steps.apk.outputs.apk }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cp "$APK" ".hope-bootstrap/output/HOPE-release.apk"
+
+          echo "Final APK:"
+          ls -lh ".hope-bootstrap/output/HOPE-release.apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HOPE-release-apk
+          path: .hope-bootstrap/output/HOPE-release.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish APK to repository
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p releases
+
+          cp \
+            ".hope-bootstrap/output/HOPE-release.apk" \
+            "releases/HOPE-release.apk"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add releases/HOPE-release.apk
+
+          if git diff --cached --quiet; then
+            echo "APK is already up to date."
+          else
+            git commit -m "chore: publish HOPE release APK"
+            git push
+          fi
+
+      - name: Detect main build workflow
+        id: workflow
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          gh workflow list \
+            --repo "$REPOSITORY" \
+            --all \
+            --json name,path \
+            --jq '.[] | [.name, .path] | @tsv' \
+            > workflow-list.txt
+
+          echo "Available workflows:"
+          cat workflow-list.txt
+
+          TARGET=""
+
+          while IFS=$'\t' read -r NAME PATH; do
+            [[ -z "$NAME" ]] && continue
+
+            NAME_LOWER="$(printf '%s' "$NAME" | tr '[:upper:]' '[:lower:]')"
+            PATH_LOWER="$(printf '%s' "$PATH" | tr '[:upper:]' '[:lower:]')"
+
+            if [[ "$NAME_LOWER" == *bootstrap* ||
+                  "$PATH_LOWER" == *bootstrap* ]]; then
+              continue
+            fi
+
+            if [[ "$NAME_LOWER" == *build* ||
+                  "$NAME_LOWER" == *android* ||
+                  "$NAME_LOWER" == *release* ||
+                  "$NAME_LOWER" == *apk* ||
+                  "$PATH_LOWER" == *build* ||
+                  "$PATH_LOWER" == *android* ]]; then
+              TARGET="$PATH"
+              break
+            fi
+          done < workflow-list.txt
+
+          if [[ -n "$TARGET" ]]; then
+            echo "Main workflow detected:"
+            echo "$TARGET"
+
+            echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+          else
+            echo "No separate main build workflow detected."
+            echo "Bootstrap workflow itself completed the APK build."
+          fi
+
+      - name: Trigger main build workflow
+        if: steps.workflow.outputs.target != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_WORKFLOW: ${{ steps.workflow.outputs.target }}
+        run: |
+          set -euo pipefail
+
+          echo "Triggering:"
+          echo "$TARGET_WORKFLOW"
+
+          gh workflow run "$TARGET_WORKFLOW" \
+            --repo "$REPOSITORY"
+
+          echo "Main workflow triggered successfully."
