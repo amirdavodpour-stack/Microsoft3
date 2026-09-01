@@ -1,0 +1,321 @@
+name: HOPE ZIP Bootstrap1
+
+on:
+  workflow_dispatch:
+    inputs:
+      archive:
+        description: "ZIP filename in repository (optional)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: hope-zip-bootstrap-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect ZIP
+        id: detect
+        shell: bash
+        env:
+          ARCHIVE_INPUT: ${{ inputs.archive }}
+        run: |
+          set -euo pipefail
+
+          ARCHIVE="$ARCHIVE_INPUT"
+
+          if test -n "$ARCHIVE"; then
+            if test ! -f "$ARCHIVE"; then
+              echo "ERROR: ZIP file not found:"
+              echo "$ARCHIVE"
+              exit 1
+            fi
+          else
+            ARCHIVE="$(find . -type f -iname '*.zip' \
+              ! -path './.git/*' \
+              -print \
+              | sort \
+              | head -n 1)"
+
+            if test -z "$ARCHIVE"; then
+              echo "ERROR: No ZIP file found in repository."
+              exit 1
+            fi
+          fi
+
+          ARCHIVE="${ARCHIVE#./}"
+
+          echo "Using ZIP:"
+          echo "$ARCHIVE"
+
+          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare directories
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf .hope-bootstrap
+
+          mkdir -p .hope-bootstrap/source
+          mkdir -p .hope-bootstrap/output
+
+      - name: Extract ZIP
+        shell: bash
+        env:
+          ARCHIVE: ${{ steps.detect.outputs.archive }}
+        run: |
+          set -euo pipefail
+
+          echo "Extracting ZIP:"
+          echo "$ARCHIVE"
+
+          unzip -q "$ARCHIVE" -d ".hope-bootstrap/source"
+
+          echo "ZIP extraction completed."
+
+          find ".hope-bootstrap/source" \
+            -maxdepth 3 \
+            -type f \
+            | sort \
+            | head -200
+
+      - name: Find Flutter project
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROOT=".hope-bootstrap/source"
+          PROJECT_ROOT=""
+
+          if test -f "$ROOT/pubspec.yaml"; then
+            PROJECT_ROOT="$ROOT"
+          else
+            PROJECT_ROOT="$(find "$ROOT" \
+              -type f \
+              -name "pubspec.yaml" \
+              ! -path "*/.dart_tool/*" \
+              -print \
+              | sort \
+              | head -n 1)"
+
+            if test -n "$PROJECT_ROOT"; then
+              PROJECT_ROOT="$(dirname "$PROJECT_ROOT")"
+            fi
+          fi
+
+          if test -z "$PROJECT_ROOT"; then
+            echo "ERROR: pubspec.yaml was not found."
+            echo
+            echo "Extracted files:"
+            find "$ROOT" -maxdepth 4 -type f | sort | head -300
+            exit 1
+          fi
+
+          echo "Flutter project:"
+          echo "$PROJECT_ROOT"
+
+          echo "project_root=$PROJECT_ROOT" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Show Flutter version
+        run: |
+          flutter --version
+
+      - name: Flutter pub get
+        shell: bash
+        env:
+          PROJECT_ROOT: ${{ steps.project.outputs.project_root }}
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_ROOT"
+
+          flutter pub get
+
+      - name: Flutter analyze
+        shell: bash
+        env:
+          PROJECT_ROOT: ${{ steps.project.outputs.project_root }}
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_ROOT"
+
+          flutter analyze
+
+      - name: Build Android APK
+        shell: bash
+        env:
+          PROJECT_ROOT: ${{ steps.project.outputs.project_root }}
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_ROOT"
+
+          flutter build apk --release
+
+      - name: Find APK
+        id: apk
+        shell: bash
+        env:
+          PROJECT_ROOT: ${{ steps.project.outputs.project_root }}
+        run: |
+          set -euo pipefail
+
+          APK="$(find "$PROJECT_ROOT/build/app/outputs" \
+            -type f \
+            -name '*.apk' \
+            -print \
+            | sort \
+            | head -n 1)"
+
+          if test -z "$APK"; then
+            echo "ERROR: APK was not generated."
+            exit 1
+          fi
+
+          echo "APK found:"
+          echo "$APK"
+
+          echo "apk=$APK" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare final APK
+        shell: bash
+        env:
+          APK: ${{ steps.apk.outputs.apk }}
+        run: |
+          set -euo pipefail
+
+          cp "$APK" ".hope-bootstrap/output/HOPE-release.apk"
+
+          echo "Final APK:"
+          ls -lh ".hope-bootstrap/output/HOPE-release.apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HOPE-release-apk
+          path: .hope-bootstrap/output/HOPE-release.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p releases
+
+          cp \
+            ".hope-bootstrap/output/HOPE-release.apk" \
+            "releases/HOPE-release.apk"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add releases/HOPE-release.apk
+
+          if git diff --cached --quiet; then
+            echo "No repository update required."
+          else
+            git commit -m "chore: publish HOPE release APK"
+            git push
+          fi
+
+      - name: List workflows
+        id: workflows
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          gh workflow list \
+            --repo "$REPOSITORY" \
+            --all \
+            --json name,path \
+            --jq '.[] | [.name, .path] | @tsv' \
+            > workflows.txt
+
+          echo "Available workflows:"
+          cat workflows.txt
+
+      - name: Detect main build workflow
+        id: main
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGET=""
+
+          while IFS="$(printf '\t')" read -r NAME PATH; do
+            test -n "$NAME" || continue
+
+            NAME_LOWER="$(printf '%s' "$NAME" | tr '[:upper:]' '[:lower:]')"
+            PATH_LOWER="$(printf '%s' "$PATH" | tr '[:upper:]' '[:lower:]')"
+
+            case "$NAME_LOWER" in
+              *bootstrap*)
+                continue
+                ;;
+            esac
+
+            case "$PATH_LOWER" in
+              *bootstrap*)
+                continue
+                ;;
+            esac
+
+            case "$NAME_LOWER $PATH_LOWER" in
+              *build*|*android*|*apk*|*release*)
+                TARGET="$PATH"
+                break
+                ;;
+            esac
+          done < workflows.txt
+
+          if test -n "$TARGET"; then
+            echo "Main build workflow found:"
+            echo "$TARGET"
+            echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+          else
+            echo "No separate main build workflow found."
+          fi
+
+      - name: Trigger main build workflow
+        if: steps.main.outputs.target != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET: ${{ steps.main.outputs.target }}
+        run: |
+          set -euo pipefail
+
+          echo "Triggering main workflow:"
+          echo "$TARGET"
+
+          gh workflow run "$TARGET" \
+            --repo "$REPOSITORY"
+
+          echo "Main workflow started."
