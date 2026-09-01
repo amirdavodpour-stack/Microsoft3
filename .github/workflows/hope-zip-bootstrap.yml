@@ -1,0 +1,107 @@
+name: HOPE ZIP Bootstrap
+
+on:
+  workflow_dispatch:
+    inputs:
+      archive:
+        description: "ZIP filename in repository (leave blank to auto-detect)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: hope-zip-bootstrap-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect ZIP archive
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${{ inputs.archive }}" ]]; then
+            ARCHIVE="${{ inputs.archive }}"
+
+            if [[ ! -f "$ARCHIVE" ]]; then
+              echo "ERROR: Specified ZIP not found: $ARCHIVE"
+              exit 1
+            fi
+          else
+            mapfile -t ZIPS < <(find . -maxdepth 3 -type f -iname "*.zip" \
+              ! -path "./.git/*" | sort)
+
+            if [[ "${#ZIPS[@]}" -eq 0 ]]; then
+              echo "ERROR: No ZIP archive found in repository."
+              exit 1
+            fi
+
+            if [[ "${#ZIPS[@]}" -gt 1 ]]; then
+              echo "Found multiple ZIP files:"
+              printf '%s\n' "${ZIPS[@]}"
+              echo
+              echo "Please run this workflow again and provide the ZIP filename."
+              exit 1
+            fi
+
+            ARCHIVE="${ZIPS[0]#./}"
+          fi
+
+          echo "Using archive: $ARCHIVE"
+          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare extraction directory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf .hope-bootstrap
+          mkdir -p .hope-bootstrap/source
+
+      - name: Extract ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ARCHIVE="${{ steps.detect.outputs.archive }}"
+
+          unzip -q "$ARCHIVE" -d .hope-bootstrap/source
+
+          echo "Extracted files:"
+          find .hope-bootstrap/source -maxdepth 3 -type f | sort | head -200
+
+      - name: Find project root
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROOT=".hope-bootstrap/source"
+
+          if [[ -f "$ROOT/pubspec.yaml" ]]; then
+            PROJECT_ROOT="$ROOT"
+          else
+            mapfile -t PUBSPECS < <(
+              find "$ROOT" -type f -name "pubspec.yaml" \
+                -not -path "*/.dart_tool/*" \
+                | sort
+            )
+
+            if [[ "${#PUBSPECS[@]}" -eq 0 ]]; then
+              echo "ERROR: Could not find pubspec.yaml in extracted ZIP."
+              exit 1
+            fi
+
+            if [[ "${
